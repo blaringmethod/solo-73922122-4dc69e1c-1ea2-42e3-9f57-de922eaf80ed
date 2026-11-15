@@ -52,7 +52,8 @@
 <header>
   <h1>SQLite 复现库缩减服务</h1>
   <p>上传结构受限的 SQLite 库与确定性 SQL 脚本，确认原始错误后自动删除数据行，
-     生成“再删任一行及其外键闭包就无法复现”的最小复现库。</p>
+     生成“再删任一行及其外键闭包就无法复现”的最小复现库；
+     下线暂存列前也可用「字段影响核查」静态评估下游 SELECT 会受到的影响。</p>
 </header>
 <main>
   <section class="card constraints">
@@ -91,6 +92,28 @@
         <span id="job-status" class="pill"></span></h2>
     <p id="job-message"></p>
     <div id="job-detail"></div>
+  </section>
+
+  <section class="card">
+    <h2>字段影响核查（下线暂存列前评估）</h2>
+    <p class="constraints">粘贴一条 SELECT 并勾选计划下线的源表列，静态追溯每个结果列的来源，
+      按列位置报告哪些值可能受影响，并指出依赖目标列的 JOIN/WHERE 条件。
+      分析不执行 SQL，也不会改动上传库或缩减结果。</p>
+    <label for="impact-db">SQLite 数据库文件（符合原约束）</label>
+    <input id="impact-db" type="file" accept=".db,.sqlite,.sqlite3,application/x-sqlite3">
+    <div style="margin-top:10px">
+      <button id="impact-load-schema" type="button" class="secondary">读取表结构</button>
+      <button id="impact-sample" type="button" class="secondary">载入 cyclic 样例与示例查询</button>
+    </div>
+    <div id="impact-targets" style="margin-top:10px"></div>
+    <label for="impact-query">SELECT 查询（单条）</label>
+    <textarea id="impact-query" placeholder="SELECT ... ;"></textarea>
+    <div><button id="impact-run" type="button">开始核查</button></div>
+  </section>
+
+  <section class="card status" id="impact-panel">
+    <h2>核查结论</h2>
+    <div id="impact-result"></div>
   </section>
 </main>
 
@@ -239,6 +262,147 @@ function finish(id, job) {
     html += `<a class="dl" href="/api/jobs/${id}/download">下载复现库 repro.db</a>`;
   }
   $('job-detail').innerHTML = html;
+}
+
+const IMPACT_STATUS_TEXT = {
+  affected: '受影响', unaffected: '不受影响', unknown: '无法确定',
+};
+const IMPACT_STATUS_CLASS = {
+  affected: 'error', unaffected: 'done', unknown: 'running',
+};
+const IMPACT_VERDICT_CLASS = {
+  affected: 'error', no_impact: 'done', unknown: 'running',
+};
+const IMPACT_VERDICT_TEXT = {
+  affected: '受影响', no_impact: '无影响', unknown: '无法完全确定',
+};
+
+function impactStatusPill(status) {
+  return `<span class="pill ${IMPACT_STATUS_CLASS[status] || ''}">` +
+    `${IMPACT_STATUS_TEXT[status] || status}</span>`;
+}
+
+function renderTargetPicker(tables) {
+  let html = '<div class="hint">勾选计划下线的源表列（至少一个）：</div>';
+  for (const t of tables) {
+    html += `<div style="margin:4px 0"><b>${esc(t.name)}</b>：`;
+    for (const c of t.columns) {
+      html += `<label style="display:inline;font-weight:400;margin:0 12px 0 0">
+        <input type="checkbox" class="impact-target"
+          value="${esc(t.name)}.${esc(c)}"> ${esc(c)}</label>`;
+    }
+    html += '</div>';
+  }
+  $('impact-targets').innerHTML = html;
+}
+
+$('impact-load-schema').addEventListener('click', async () => {
+  const db = $('impact-db').files[0];
+  if (!db) { alert('请选择数据库文件'); return; }
+  const form = new FormData();
+  form.append('db', db);
+  $('impact-targets').innerHTML = '<span class="hint">正在读取表结构…</span>';
+  try {
+    const r = await fetch('/api/impact/schema', { method: 'POST', body: form });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    renderTargetPicker(data.tables);
+  } catch (err) {
+    $('impact-targets').innerHTML = `<span class="err">${esc(err.message)}</span>`;
+  }
+});
+
+$('impact-sample').addEventListener('click', async () => {
+  const dbResp = await fetch('/static/sample_cyclic.db');
+  const dbBlob = await dbResp.blob();
+  const dt = new DataTransfer();
+  dt.items.add(new File([dbBlob], 'sample_cyclic.db'));
+  $('impact-db').files = dt.files;
+  $('impact-query').value = [
+    'WITH team AS (',
+    '  SELECT e.id AS emp_id, e.dept_id AS dep',
+    '  FROM employee e',
+    ')',
+    'SELECT t.emp_id, t.dep, d.name',
+    'FROM team t JOIN dept d ON t.dep = d.id',
+    "WHERE d.name = 'Platform' OR t.dep > 1;",
+  ].join('\n');
+  $('impact-load-schema').click();
+});
+
+$('impact-run').addEventListener('click', async () => {
+  const db = $('impact-db').files[0];
+  const query = $('impact-query').value;
+  const targets = [...document.querySelectorAll('.impact-target:checked')]
+    .map((x) => x.value);
+  if (!db) { alert('请选择数据库文件'); return; }
+  if (!query.trim()) { alert('请粘贴 SELECT 查询'); return; }
+  if (!targets.length) { alert('请勾选至少一个待下线列'); return; }
+  const form = new FormData();
+  form.append('db', db);
+  form.append('query', query);
+  for (const t of targets) form.append('targets', t);
+  $('impact-run').disabled = true;
+  $('impact-panel').classList.add('active');
+  $('impact-result').innerHTML = '<span class="hint">正在静态分析…</span>';
+  try {
+    const r = await fetch('/api/impact', { method: 'POST', body: form });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    renderImpact(data);
+  } catch (err) {
+    $('impact-result').innerHTML = `<span class="err">${esc(err.message)}</span>`;
+  } finally {
+    $('impact-run').disabled = false;
+  }
+});
+
+function renderImpact(data) {
+  let html = `<p><span class="pill ${IMPACT_VERDICT_CLASS[data.verdict] || ''}">
+    总体结论：${IMPACT_VERDICT_TEXT[data.verdict] || data.verdict}</span>
+    ${esc(data.verdict_text)}</p>`;
+  html += `<p class="hint">目标列：${data.targets.map((t) => esc(t.table + '.' + t.column)).join('、') || '（无）'}</p>`;
+
+  if (data.columns && data.columns.length) {
+    html += '<h3 style="font-size:14px;margin:14px 0 4px">结果列（按位置）</h3>';
+    html += '<table><tr><th>位置</th><th>结果列</th><th>表达式</th><th>结论</th>' +
+      '<th>来源（基表列）</th><th>命中目标</th><th>追溯链</th></tr>';
+    for (const c of data.columns) {
+      const src = c.sources.map((s) => esc(s.table + '.' + s.column)).join('<br>');
+      const hit = c.matched_targets.map((s) => esc(s.table + '.' + s.column)).join('<br>');
+      const trace = c.trace.length
+        ? `<details><summary>${c.trace.length} 条</summary>` +
+          c.trace.map((t) => `<div class="hint">${esc(t)}</div>`).join('') + '</details>'
+        : '';
+      html += `<tr><td>${c.pos}</td><td>${esc(c.name)}</td>
+        <td><code>${esc(c.expression)}</code></td>
+        <td>${impactStatusPill(c.status)}</td>
+        <td>${src}</td><td>${hit || '—'}</td><td>${trace}</td></tr>`;
+    }
+    html += '</table>';
+  }
+
+  if (data.conditions && data.conditions.length) {
+    html += '<h3 style="font-size:14px;margin:14px 0 4px">行集条件（JOIN ON / WHERE）</h3>';
+    html += '<table><tr><th>类型</th><th>位置</th><th>条件</th><th>结论</th><th>命中目标</th></tr>';
+    for (const c of data.conditions) {
+      const hit = c.matched_targets.map((s) => esc(s.table + '.' + s.column)).join('<br>');
+      html += `<tr><td>${esc(c.kind)}</td><td>${esc(c.location)}</td>
+        <td><code>${esc(c.text)}</code></td>
+        <td>${impactStatusPill(c.status)}</td><td>${hit || '—'}</td></tr>`;
+    }
+    html += '</table>';
+    html += '<p class="hint">依赖目标列的条件会使查询结果的行集发生变化。</p>';
+  }
+
+  if (data.problems && data.problems.length) {
+    html += '<h3 style="font-size:14px;margin:14px 0 4px">无法确认的位置</h3><ul>';
+    for (const p of data.problems) {
+      html += `<li><b>${esc(p.location)}</b>：${esc(p.message)}</li>`;
+    }
+    html += '</ul>';
+  }
+  $('impact-result').innerHTML = html;
 }
 
 loadSamples();

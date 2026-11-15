@@ -5,6 +5,21 @@
 表结构与剩余行值不变、外键始终有效的前提下删除数据行，直到得到 **1-最小**
 复现库——删除任意一行（连同直接或间接引用它的全部行）后都无法再复现同一错误。
 
+## 字段影响核查（下线暂存列前评估）
+
+数仓开发者下线暂存库字段前，用它评估下游取数会丢哪些值、哪些行可能改变：
+上传符合原约束的 SQLite 库，粘贴一条 SELECT 并勾选待下线的源表列，
+服务**静态追溯**每个结果列的来源，按列位置报告哪些值可能受影响，
+并指出依赖目标列的 JOIN/WHERE 条件（行集可能因此改变）。
+
+* 支持：至多两张源表、表别名、JOIN ON、一层非递归 WITH、
+  `SELECT *`、列引用及四则运算投影；筛选条件支持列比较及 AND/OR；
+* CTE 改名、同名列、通配符展开后仍按位置正确归属；
+* 无法消歧或超出支持范围（函数、子查询、DISTINCT、GROUP BY、NOT、
+  IN/LIKE/IS、UNION、递归/嵌套 WITH 等）时**指出具体位置**，
+  绝不给出“无影响”结论；
+* 分析不执行 SQL，也不修改上传库或已有缩减结果。
+
 ## 复现判定（严格）
 
 * 以 SQLite **扩展错误码 + 完整错误文本** 作为错误指纹，两者完全一致才算复现；
@@ -59,7 +74,8 @@ docker compose up --build
 ```
 
 页面支持：上传库与脚本（文件或粘贴文本）、运行、轮询查看删减结果与日志、
-下载复现库 `repro.db`，并内置两个可一键试跑的样例。
+下载复现库 `repro.db`，并内置两个可一键试跑的样例；字段影响核查为独立面板，
+支持读取表结构、勾选待下线列、粘贴 SELECT 并查看逐列归因结论。
 
 停止与清理：
 
@@ -74,7 +90,7 @@ docker compose down -v       # 同时删除任务数据卷
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 DATA_DIR=./data .venv/bin/uvicorn app.main:app --reload --port 8000
-.venv/bin/pytest             # 48 个测试
+.venv/bin/pytest             # 全部测试
 ```
 
 ## 内置样例
@@ -107,6 +123,8 @@ DATA_DIR=./data .venv/bin/uvicorn app.main:app --reload --port 8000
 | POST | `/api/jobs` | 表单字段 `db`（必填）、`sql`（文件）或 `script_text`（文本），返回 202 与任务 id |
 | GET | `/api/jobs/{id}` | 查询任务状态、错误指纹、行数变化、保留行与缩减日志 |
 | GET | `/api/jobs/{id}/download` | 下载复现库 `repro.db`（仅缩减成功时可用） |
+| POST | `/api/impact/schema` | 上传库 `db` 文件 → 返回表结构（列名清单） |
+| POST | `/api/impact` | 表单字段 `db`、`query`（单条 SELECT）、`targets`（`表.列`，可重复），返回静态核查结论 |
 
 ## 目录结构
 
@@ -120,10 +138,12 @@ app/
   reducer.py       # ddmin + 逐行闭包终检
   jobs.py          # 后台任务与并发/TTL 管理
   service.py       # 上传->校验->确认->缩减 流水线
+  select_sql.py    # SELECT 子集解析（不执行），超范围语法记录位置
+  impact.py        # 字段影响静态归因：结果列来源、JOIN/WHERE 依赖
   samples.py       # 内置样例生成
   main.py          # FastAPI 路由
   static/index.html
-tests/             # 48 个单元/集成/端到端测试
+tests/             # 单元/集成/端到端测试
 Dockerfile
 docker-compose.yml
 ```

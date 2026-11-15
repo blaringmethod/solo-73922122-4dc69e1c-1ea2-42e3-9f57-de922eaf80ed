@@ -11,3 +11,8 @@ class ScriptRejected(Exception):
 
 class JobError(Exception):
     """任务状态相关错误。"""
+
+
+class ImpactError(Exception):
+    """字段影响核查失败（无法解析或目标不存在）。"""
+
